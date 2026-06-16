@@ -5,8 +5,9 @@ After=network-online.target
 [Service]
 Type=simple
 User=root
+Environment=MEMORY_SCRIPT=/usr/local/bin/memory-limit.sh
 EnvironmentFile=-/etc/oalive/oalive.conf
-ExecStart=/bin/sh /usr/local/bin/memory-limit.sh
+ExecStart=/bin/sh ${MEMORY_SCRIPT}
 Restart=always
 RestartSec=30s
 KillMode=control-group

@@ -8,9 +8,9 @@ umask 077
 init_locale() {
   utf8_locale=$(locale -a 2>/dev/null | awk 'tolower($0) ~ /utf-?8/ {print; exit}')
   if [ -n "$utf8_locale" ]; then
-    export LC_ALL=$utf8_locale
-    export LANG=$utf8_locale
-    export LANGUAGE=$utf8_locale
+    export LC_ALL="$utf8_locale"
+    export LANG="$utf8_locale"
+    export LANGUAGE="$utf8_locale"
   fi
 }
 
@@ -148,6 +148,22 @@ get_total_kb() {
   page_size=$(sysctl -n hw.pagesize 2>/dev/null || true)
   if is_uint "$pages" && is_uint "$page_size" && [ "$pages" -gt 0 ] && [ "$page_size" -gt 0 ]; then
     printf '%s\n' $((pages * page_size / 1024))
+    return
+  fi
+  if command -v vm_stat >/dev/null 2>&1; then
+    page_size=$(vm_stat 2>/dev/null | awk '/page size of/ {gsub(/[^0-9]/, "", $8); print $8; exit}')
+    pages=$(vm_stat 2>/dev/null | awk '
+      /^Pages / {
+        value = $NF
+        gsub(/[^0-9]/, "", value)
+        if (value != "") sum += value
+      }
+      END {print sum + 0}
+    ')
+    if is_uint "$page_size" && is_uint "$pages" && [ "$pages" -gt 0 ]; then
+      printf '%s\n' $((pages * page_size / 1024))
+      return
+    fi
   fi
 }
 

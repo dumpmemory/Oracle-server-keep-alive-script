@@ -15,6 +15,7 @@ LOG_DIR=${OALIVE_LOG_DIR:-/var/log/oalive}
 STATE_DIR=${OALIVE_STATE_DIR:-/var/lib/oalive}
 RUN_DIR=${OALIVE_RUN_DIR:-/tmp}
 SYSTEMD_DIR=${OALIVE_SYSTEMD_DIR:-/etc/systemd/system}
+DOWNLOAD_TIMEOUT=${OALIVE_DOWNLOAD_TIMEOUT:-30}
 CRON_BEGIN="# OALIVE BEGIN"
 CRON_END="# OALIVE END"
 
@@ -46,7 +47,7 @@ fi
 
 setup_script_dir() {
   case $0 in
-    */*) SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd -P || printf '%s\n' ".") ;;
+    */*) SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" 2>/dev/null && pwd -P || printf '%s\n' ".") ;;
     *) SCRIPT_DIR=$(pwd -P 2>/dev/null || pwd) ;;
   esac
 }
@@ -81,6 +82,10 @@ sq() {
   printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
+cron_escape() {
+  printf '%s' "$1" | sed 's/%/\\%/g'
+}
+
 need_root() {
   uid=$(id -u 2>/dev/null || echo 1)
   if [ "$uid" != 0 ]; then
@@ -92,9 +97,9 @@ need_root() {
 init_locale() {
   utf8_locale=$(locale -a 2>/dev/null | awk 'tolower($0) ~ /utf-?8/ {print; exit}')
   if [ -n "$utf8_locale" ]; then
-    export LC_ALL=$utf8_locale
-    export LANG=$utf8_locale
-    export LANGUAGE=$utf8_locale
+    export LC_ALL="$utf8_locale"
+    export LANG="$utf8_locale"
+    export LANGUAGE="$utf8_locale"
   elif locale -a 2>/dev/null | grep -q '^C.UTF-8$'; then
     export LC_ALL=C.UTF-8
     export LANG=C.UTF-8
@@ -259,7 +264,7 @@ pkg_remove() {
     apk) apk del "$@" ;;
     pacman) pacman -Rsc --noconfirm "$@" ;;
     pkg) pkg delete -y "$@" ;;
-    pkg_delete) pkg_delete "$@" ;;
+    pkg_add|pkg_delete) pkg_delete "$@" ;;
     pkgin) pkgin -y remove "$@" ;;
     xbps-install) xbps-remove -Ry "$@" ;;
     emerge) emerge --depclean "$@" ;;
@@ -283,16 +288,17 @@ refresh_paths_from_config() {
 download_to() {
   url=$1
   dest=$2
+  is_uint "$DOWNLOAD_TIMEOUT" || DOWNLOAD_TIMEOUT=30
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$dest"
+    curl -fsSL --connect-timeout 10 --max-time "$DOWNLOAD_TIMEOUT" "$url" -o "$dest"
     return $?
   fi
   if command -v wget >/dev/null 2>&1; then
-    wget -qO "$dest" "$url"
+    wget -q --timeout=10 --tries=3 -O "$dest" "$url"
     return $?
   fi
   if command -v fetch >/dev/null 2>&1; then
-    fetch -q -o "$dest" "$url"
+    fetch -q -T "$DOWNLOAD_TIMEOUT" -o "$dest" "$url"
     return $?
   fi
   return 1
@@ -304,12 +310,24 @@ install_file() {
   mode=$3
   tmp=$dest.tmp.$$
   if [ -f "$SCRIPT_DIR/$name" ]; then
-    cp "$SCRIPT_DIR/$name" "$tmp" || return 1
+    cp "$SCRIPT_DIR/$name" "$tmp" || {
+      rm -f "$tmp" 2>/dev/null || true
+      return 1
+    }
   else
-    download_to "$BASE_URL/$name" "$tmp" || return 1
+    download_to "$BASE_URL/$name" "$tmp" || {
+      rm -f "$tmp" 2>/dev/null || true
+      return 1
+    }
   fi
-  chmod "$mode" "$tmp" || return 1
-  mv "$tmp" "$dest"
+  chmod "$mode" "$tmp" || {
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  }
+  mv "$tmp" "$dest" || {
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  }
 }
 
 get_cores() {
@@ -415,21 +433,24 @@ systemd_enable_restart() {
 }
 
 install_systemd() {
+  mkdir -p "$SYSTEMD_DIR" || return 1
   install_file cpu-limit.service "$SYSTEMD_DIR/cpu-limit.service" 644 || return 1
   install_file memory-limit.service "$SYSTEMD_DIR/memory-limit.service" 644 || return 1
   install_file bandwidth_occupier.service "$SYSTEMD_DIR/bandwidth_occupier.service" 644 || return 1
   install_file bandwidth_occupier.timer "$SYSTEMD_DIR/bandwidth_occupier.timer" 644 || return 1
 
-  mkdir -p "$SYSTEMD_DIR/cpu-limit.service.d" "$SYSTEMD_DIR/bandwidth_occupier.timer.d"
+  mkdir -p "$SYSTEMD_DIR/cpu-limit.service.d" "$SYSTEMD_DIR/bandwidth_occupier.timer.d" || return 1
   cat >"$SYSTEMD_DIR/cpu-limit.service.d/quota.conf" <<EOF
 [Service]
 CPUQuota=${CPU_QUOTA_PERCENT}%
 EOF
+  [ -s "$SYSTEMD_DIR/cpu-limit.service.d/quota.conf" ] || return 1
   cat >"$SYSTEMD_DIR/bandwidth_occupier.timer.d/interval.conf" <<EOF
 [Timer]
 OnUnitActiveSec=
 OnUnitActiveSec=${BANDWIDTH_INTERVAL_MINUTES}min
 EOF
+  [ -s "$SYSTEMD_DIR/bandwidth_occupier.timer.d/interval.conf" ] || return 1
 
   if [ "$CPU_ENABLED" = 1 ]; then
     systemd_enable_restart cpu-limit.service || warn "CPU服务启动失败，请查看日志" "Failed to start CPU service, please check logs"
@@ -456,6 +477,7 @@ EOF
 }
 
 remove_cron_block() {
+  command -v crontab >/dev/null 2>&1 || return 0
   tmp=$(mktemp "${TMPDIR:-/tmp}/oalive-cron.XXXXXX") || return 1
   new=$(mktemp "${TMPDIR:-/tmp}/oalive-cron-new.XXXXXX") || {
     rm -f "$tmp"
@@ -489,12 +511,18 @@ install_cron() {
     $0 == end {skip=0; next}
     !skip {print}
   ' "$tmp" >"$new"
+  cron_runner_cmd=$(cron_escape "/bin/sh $(sq "$INSTALL_DIR/oalive-cron-runner.sh") >/dev/null 2>&1")
   {
     printf '%s\n' "$CRON_BEGIN"
-    printf '%s\n' "* * * * * $INSTALL_DIR/oalive-cron-runner.sh >/dev/null 2>&1"
+    printf '%s\n' "* * * * * $cron_runner_cmd"
     printf '%s\n' "$CRON_END"
   } >>"$new"
-  crontab "$new"
+  if ! crontab "$new"; then
+    rm -f "$tmp" "$new"
+    warn "cron任务安装失败，将只启动当前进程" "Failed to install cron job; starting current process only"
+    /bin/sh "$INSTALL_DIR/oalive-cron-runner.sh" >/dev/null 2>&1 || true
+    return 1
+  fi
   rm -f "$tmp" "$new"
   /bin/sh "$INSTALL_DIR/oalive-cron-runner.sh" >/dev/null 2>&1 || true
 }
@@ -530,8 +558,9 @@ install_speedtest_go_linux() {
   tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/oalive-speedtest.XXXXXX") || return 1
   url="https://github.com/showwin/speedtest-go/releases/download/v1.6.0/speedtest-go_1.6.0_Linux_${asset_arch}.tar.gz"
   if download_to "$url" "$tmpdir/speedtest-go.tar.gz" && mkdir -p "$(dirname "$SPEEDTEST_GO_BIN")" && tar -zxf "$tmpdir/speedtest-go.tar.gz" -C "$tmpdir"; then
-    if [ -f "$tmpdir/speedtest-go" ]; then
-      cp "$tmpdir/speedtest-go" "$SPEEDTEST_GO_BIN"
+    speedtest_path=$(find "$tmpdir" -type f -name speedtest-go 2>/dev/null | sed -n '1p')
+    if [ -n "$speedtest_path" ]; then
+      cp "$speedtest_path" "$SPEEDTEST_GO_BIN"
       chmod 755 "$SPEEDTEST_GO_BIN"
       rm -rf "$tmpdir"
       return 0
@@ -708,11 +737,21 @@ stop_by_lock() {
 kill_script_path() {
   script=$1
   [ -n "$script" ] || return 0
-  if command -v pkill >/dev/null 2>&1; then
-    pkill -f "$script" >/dev/null 2>&1 || true
-    return 0
-  fi
-  (ps -eo pid= -o args= 2>/dev/null || ps ax -o pid= -o command= 2>/dev/null) | awk -v s="$script" 'index($0, s) {print $1}' | while IFS= read -r pid; do
+  (ps -eo pid= -o args= 2>/dev/null || ps ax -o pid= -o command= 2>/dev/null) |
+    awk -v s="$script" -v self="$$" '
+      $1 == self {next}
+      index($0, s) {
+        command = $0
+        sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", command)
+        pos = index(command, s)
+        if (pos > 0) {
+          before = pos == 1 ? " " : substr(command, pos - 1, 1)
+          after = substr(command, pos + length(s), 1)
+          if ((before == " " || before == "\t") && (after == "" || after == " " || after == "\t")) print $1
+        }
+      }
+    ' |
+    while IFS= read -r pid; do
     is_uint "$pid" && kill "$pid" 2>/dev/null || true
   done
 }

@@ -7,9 +7,9 @@ umask 077
 init_locale() {
   utf8_locale=$(locale -a 2>/dev/null | awk 'tolower($0) ~ /utf-?8/ {print; exit}')
   if [ -n "$utf8_locale" ]; then
-    export LC_ALL=$utf8_locale
-    export LANG=$utf8_locale
-    export LANGUAGE=$utf8_locale
+    export LC_ALL="$utf8_locale"
+    export LANG="$utf8_locale"
+    export LANGUAGE="$utf8_locale"
   fi
 }
 
@@ -110,7 +110,11 @@ with_schedule_lock() {
     return 1
   fi
   rm -rf "$lock" 2>/dev/null || true
-  mkdir "$lock" 2>/dev/null
+  if mkdir "$lock" 2>/dev/null; then
+    printf '%s\n' "$$" >"$lock/pid"
+    return 0
+  fi
+  return 1
 }
 
 release_schedule_lock() {
@@ -138,6 +142,15 @@ run_bandwidth_if_due() {
   lock_pid_alive bandwidth && return 0
 
   with_schedule_lock || return 0
+  now_s=$(date '+%s' 2>/dev/null || echo 0)
+  is_uint "$now_s" || now_s=0
+  last=0
+  [ -r "$last_file" ] && last=$(sed -n '1p' "$last_file" 2>/dev/null || echo 0)
+  is_uint "$last" || last=0
+  if [ "$now_s" -eq 0 ] || [ $((now_s - last)) -lt "$interval_seconds" ] || lock_pid_alive bandwidth; then
+    release_schedule_lock
+    return 0
+  fi
   printf '%s\n' "$now_s" >"$last_file" 2>/dev/null || true
   release_schedule_lock
 

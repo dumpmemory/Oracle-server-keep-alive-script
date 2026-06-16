@@ -8,9 +8,9 @@ umask 077
 init_locale() {
   utf8_locale=$(locale -a 2>/dev/null | awk 'tolower($0) ~ /utf-?8/ {print; exit}')
   if [ -n "$utf8_locale" ]; then
-    export LC_ALL=$utf8_locale
-    export LANG=$utf8_locale
-    export LANGUAGE=$utf8_locale
+    export LC_ALL="$utf8_locale"
+    export LANG="$utf8_locale"
+    export LANGUAGE="$utf8_locale"
   fi
 }
 

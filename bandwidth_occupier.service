@@ -6,8 +6,9 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 User=root
+Environment=BANDWIDTH_SCRIPT=/usr/local/bin/bandwidth_occupier.sh
 EnvironmentFile=-/etc/oalive/oalive.conf
-ExecStart=/bin/sh /usr/local/bin/bandwidth_occupier.sh
+ExecStart=/bin/sh ${BANDWIDTH_SCRIPT}
 TimeoutStartSec=0
 
 [Install]
